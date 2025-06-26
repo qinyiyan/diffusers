@@ -20,11 +20,20 @@ from typing import List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import jax.numpy as jnp
+import jax
+import torchax
 
 from ..configuration_utils import ConfigMixin, register_to_config
 from ..utils import deprecate, is_scipy_available
 from .scheduling_utils import KarrasDiffusionSchedulers, SchedulerMixin, SchedulerOutput
 
+
+try:
+    import torch_xla.core.xla_model as xm
+    _has_xla = True
+except ImportError:
+    _has_xla = False
 
 if is_scipy_available():
     import scipy.stats
@@ -271,7 +280,9 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         self.last_sample = None
         self._step_index = None
         self._begin_index = None
-        self.sigmas = self.sigmas.to("cpu")  # to avoid too much CPU/GPU communication
+        self._last_sample_is_valid_xla = False
+        self.this_order = 0
+
 
     @property
     def step_index(self):
@@ -298,7 +309,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         """
         self._begin_index = begin_index
 
-    def set_timesteps(self, num_inference_steps: int, device: Union[str, torch.device] = None):
+    def set_timesteps(self, num_inference_steps: int, shape: Tuple, device: Union[str, torch.device] = None):
         """
         Sets the discrete timesteps used for the diffusion chain (to be run before inference).
 
@@ -402,14 +413,20 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
                 )
             sigmas = np.concatenate([sigmas, [sigma_last]]).astype(np.float32)
 
-        self.sigmas = torch.from_numpy(sigmas)
-        self.timesteps = torch.from_numpy(timesteps).to(device=device, dtype=torch.int64)
+        # self.sigmas = torch.from_numpy(sigmas)
+        # self.timesteps = torch.from_numpy(timesteps).to(device=device, dtype=torch.int64)
+        self.sigmas = torch.from_numpy(sigmas).to('jax') 
+        self.timesteps = torch.from_numpy(timesteps).to('jax') # dtype already int64 by numpy
+
 
         self.num_inference_steps = len(timesteps)
 
-        self.model_outputs = [
-            None,
-        ] * self.config.solver_order
+        #self.model_outputs = [
+        #    torch.zeros(shape).to('jax')
+        #    for _ in range(self.config.solver_order)
+        #]
+        self.model_outputs = torch.zeros((self.config.solver_order,) + shape).to('jax')
+        self.timestep_list = torch.zeros((self.config.solver_order,)).to('jax')
         self.lower_order_nums = 0
         self.last_sample = None
         if self.solver_p:
@@ -418,7 +435,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         # add an index counter for schedulers that allow duplicated timesteps
         self._step_index = None
         self._begin_index = None
-        self.sigmas = self.sigmas.to("cpu")  # to avoid too much CPU/GPU communication
+        #self.sigmas = self.sigmas.to("cpu")  # to avoid too much CPU/GPU communication
 
     # Copied from diffusers.schedulers.scheduling_ddpm.DDPMScheduler._threshold_sample
     def _threshold_sample(self, sample: torch.Tensor) -> torch.Tensor:
@@ -617,7 +634,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             elif self.config.prediction_type == "flow_prediction":
                 sigma_t = self.sigmas[self.step_index]
                 #NOTE(hanq): sigma_t is scalar
-                x0_pred = sample - sigma_t.item() * model_output
+                x0_pred = sample - sigma_t * model_output
             else:
                 raise ValueError(
                     f"prediction_type given as {self.config.prediction_type} must be one of `epsilon`, `sample`, "
@@ -651,23 +668,6 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         order: int = None,
         **kwargs,
     ) -> torch.Tensor:
-        """
-        One step for the UniP (B(h) version). Alternatively, `self.solver_p` is used if is specified.
-
-        Args:
-            model_output (`torch.Tensor`):
-                The direct output from the learned diffusion model at the current timestep.
-            prev_timestep (`int`):
-                The previous discrete timestep in the diffusion chain.
-            sample (`torch.Tensor`):
-                A current instance of a sample created by the diffusion process.
-            order (`int`):
-                The order of UniP at this timestep (corresponds to the *p* in UniPC-p).
-
-        Returns:
-            `torch.Tensor`:
-                The sample tensor at the previous timestep.
-        """
         prev_timestep = args[0] if len(args) > 0 else kwargs.pop("prev_timestep", None)
         if sample is None:
             if len(args) > 1:
@@ -679,6 +679,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
                 order = args[2]
             else:
                 raise ValueError(" missing `order` as a required keyward argument")
+        print(f"{order=}")
         if prev_timestep is not None:
             deprecate(
                 "prev_timestep",
@@ -705,22 +706,53 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         h = lambda_t - lambda_s0
         device = sample.device
 
-        rks = []
-        D1s = []
-        for i in range(1, order):
-            si = self.step_index - i
-            mi = model_output_list[-(i + 1)]
+
+        def rk_d1_loop_body(i, carry):
+        # Loop from i = 0 to order-2
+            rks, D1s = carry
+            history_idx = self.config.solver_order - 2 - i
+            mi = self.model_outputs[history_idx]
+            si_val = self.timestep_list[history_idx]
+            si = self.step_index - i + 1
             alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si])
-            lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
+            lambda_si = torch.log(alpha_si + 1e-10) - torch.log(sigma_si + 1e-10)
+
             rk = (lambda_si - lambda_s0) / h
-            rks.append(rk)
-            D1s.append((mi - m0) / rk)
+            Di = (mi - m0) / rk
 
-        rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
+            #rks = rks.at[i].set(rk)
+            #D1s = D1s.at[i].set(Di)
+            rks[i] = rk
+            D1s[i] = Di
+            return rks, D1s
 
-        R = []
-        b = []
+        #rks_init = jnp.zeros(self.config.solver_order, dtype=h_jax.dtype)
+        #D1s_init = jnp.zeros((self.config.solver_order - 1, *m0.shape), dtype=m0_jax.dtype)
+        #if self.config.solver_order == 1:
+        #    # Dummy D1s array. It will not be used if order == 1
+        #    D1s_init = jnp.zeros((1, *m0.shape), dtype=m0_jax.dtype)
+        rks_init = torch.zeros(self.config.solver_order).to('jax')
+        D1s_init = torch.zeros((self.config.solver_order - 1, *m0.shape)).to('jax')
+        if self.config.solver_order == 1:
+        # Dummy D1s array. It will not be used if order == 1
+            D1s_init = torch.zeros((1, *m0.shape)).to('jax')
+        order = order.to('jax')
+        rks, D1s = torchax.interop.fori_loop(0, order - 1, rk_d1_loop_body, (rks_init, D1s_init))
+        
+        # for i in range(1, order):
+        #     si = self.step_index - i
+        #     mi = model_output_list[-(i + 1)]
+        #     alpha_si, sigma_si = self._sigma_to_alpha_sigma_t(self.sigmas[si])
+        #     lambda_si = torch.log(alpha_si) - torch.log(sigma_si)
+        #     rk = (lambda_si - lambda_s0) / h
+        #     rks.append(rk)
+        #     D1s.append((mi - m0) / rk)
+
+        #rks = rks.at[order - 1].set(1.0)
+        rks[order - 1] = 1.0 
+        #rks = torch.tensor(rks, device=device)
+        #D1s = torch.tensor(D1s, device=device)
+
 
         hh = -h if self.predict_x0 else h
         h_phi_1 = torch.expm1(hh)  # h\phi_1(h) = e^h - 1
@@ -735,22 +767,55 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         else:
             raise NotImplementedError()
 
-        for i in range(1, order + 1):
-            R.append(torch.pow(rks, i - 1))
-            b.append(h_phi_k * factorial_i / B_h)
-            factorial_i *= i + 1
-            h_phi_k = h_phi_k / hh - 1 / factorial_i
+        # R = []
+        # b = []
+        # for i in range(1, order + 1):
+        #     R.append(torch.pow(rks, i - 1))
+        #     b.append(h_phi_k * factorial_i / B_h)
+        #     factorial_i *= i + 1
+        #     h_phi_k = h_phi_k / hh - 1 / factorial_i
 
-        R = torch.stack(R)
-        b = torch.tensor(b, device=device)
+        # R = torch.stack(R)
+        # b = torch.tensor(b, device=device)
+
+
+        def rb_loop_body(i, carry):
+            R, b, current_h_phi_k, factorial_val = carry
+            #R = R.at[i].set(torch.pow(rks, i))
+            #b = b.at[i].set(current_h_phi_k * factorial_val / B_h)
+            R[i] = torch.pow(rks, i)
+            b[i] = current_h_phi_k * factorial_val / B_h
+            def update_fn(vals):
+                _h_phi_k, _fac = vals
+                next_fac = _fac * (i + 2)
+                next_h_phi_k = _h_phi_k / hh - 1.0 / next_fac
+                return next_h_phi_k, next_fac
+
+            current_h_phi_k, factorial_val = torchax.interop.torch_view(jax.lax.cond)(
+                i < order - 1,
+                update_fn,
+                lambda vals: vals,
+                (current_h_phi_k, factorial_val),
+            )
+            return R, b, current_h_phi_k, factorial_val
+
+        R_init = torch.zeros((self.config.solver_order, self.config.solver_order), dtype=h.dtype).to('jax')
+        b_init = torch.zeros(self.config.solver_order, dtype=h.dtype).to('jax')
+        init_h_phi_k = h_phi_1 / hh - 1.0
+        init_factorial = 1.0
+        R, b, _, _ = torchax.interop.fori_loop(0, order, rb_loop_body, (R_init, b_init, init_h_phi_k, init_factorial))
+
+
 
         if len(D1s) > 0:
-            D1s = torch.stack(D1s, dim=1)  # (B, K)
+            D1s = torchax.interop.torch_view(jnp.stack)(D1s, axis=1)  # (B, K)
             # for order 2, we use a simplified version
-            if order == 2:
-                rhos_p = torch.tensor([0.5], dtype=x.dtype, device=device)
-            else:
-                rhos_p = torch.linalg.solve(R[:-1, :-1], b[:-1]).to(device).to(x.dtype)
+            # if order == 2:
+            #     rhos_p = torch.tensor([0.5], dtype=x.dtype, device=device)
+            # else:
+            #     rhos_p = torch.linalg.solve(R[:-1, :-1], b[:-1]).to(device).to(x.dtype)
+            rhos_p = torch.where(order == 2, torch.tensor([0.5], dtype=x.dtype, device=device),
+                torch.linalg.solve(R[:-1, :-1], b[:-1]))
         else:
             D1s = None
 
@@ -771,6 +836,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
 
         x_t = x_t.to(x.dtype)
         return x_t
+
 
     def multistep_uni_c_bh_update(
         self,
@@ -801,11 +867,11 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
                 The corrected sample tensor at the current timestep.
         """
         this_timestep = args[0] if len(args) > 0 else kwargs.pop("this_timestep", None)
-        if last_sample is None:
-            if len(args) > 1:
-                last_sample = args[1]
-            else:
-                raise ValueError(" missing`last_sample` as a required keyward argument")
+        # if last_sample is None:
+        #     if len(args) > 1:
+        #         last_sample = args[1]
+        #     else:
+        #         raise ValueError(" missing`last_sample` as a required keyward argument")
         if this_sample is None:
             if len(args) > 2:
                 this_sample = args[2]
@@ -826,7 +892,13 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         model_output_list = self.model_outputs
 
         m0 = model_output_list[-1]
-        x = last_sample
+        #x = last_sample
+
+        if last_sample is not None:
+            x = last_sample
+        else:
+            # If it's None, create dummy data. This is for the tracing purpose
+            x = torch.zeros_like(this_sample).to('jax')
         x_t = this_sample
         model_t = this_model_output
 
@@ -876,7 +948,8 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             factorial_i *= i + 1
             h_phi_k = h_phi_k / hh - 1 / factorial_i
 
-        R = torch.stack(R)
+        if order > 0:
+            R = torch.stack(R)
         b = torch.tensor(b, device=device)
 
         if len(D1s) > 0:
@@ -885,12 +958,13 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
             D1s = None
 
         # for order 1, we use a simplified version
-        if order == 1:
+        if order <= 1:
             rhos_c = torch.tensor([0.5], dtype=x.dtype, device=device)
+            #rhos_c = jnp.array([0.5], dtype=x.dtype)
         else:
-            R = R.to(torch.float32)
-            b = b.to(torch.float32)
-            rhos_c = torch.linalg.solve(R, b).to(device).to(x.dtype)
+            R =  torch.tensor(R, dtype=x_t.dtype)
+            b =  torch.tensor(b, dtype=x_t.dtype)
+            rhos_c = torch.linalg.solve(R, b)
 
         if self.predict_x0:
             x_t_ = sigma_t / sigma_s0 * x - alpha_t * h_phi_1 * m0
@@ -916,19 +990,18 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         if schedule_timesteps is None:
             schedule_timesteps = self.timesteps
 
-        index_candidates = (schedule_timesteps == timestep).nonzero()
 
-        if len(index_candidates) == 0:
-            step_index = len(self.timesteps) - 1
-        # The sigma index that is taken for the **very** first `step`
-        # is always the second index (or the last index if there is only 1)
-        # This way we can ensure we don't accidentally skip a sigma in
-        # case we start in the middle of the denoising schedule (e.g. for image-to-image)
-        elif len(index_candidates) > 1:
-            step_index = index_candidates[1].item()
-        else:
-            step_index = index_candidates[0].item()
+        timestep_val = timestep
 
+        #index_candidates = torch.where(schedule_timesteps == timestep_val, size=1, fill_value=-1)[0]
+        #index_candidates = (schedule_timesteps == timestep_val).nonzero(as_tuple=True)[0]
+        index_candidates = torchax.interop.torch_view(jnp.where)(schedule_timesteps == timestep_val, size=1, fill_value=-1)[0]
+
+        step_index = torch.where(
+            index_candidates[0] == -1,  # No match found
+            len(schedule_timesteps) - 1,  # Default to last index
+            index_candidates[0],
+        )
         return step_index
 
     # Copied from diffusers.schedulers.scheduling_dpmsolver_multistep.DPMSolverMultistepScheduler._init_step_index
@@ -944,6 +1017,7 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         else:
             self._step_index = self._begin_index
 
+    #@partial(torchax.interop.jit, static_argnums=(0,4)) 
     def step(
         self,
         model_output: torch.Tensor,
@@ -979,40 +1053,81 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         if self.step_index is None:
             self._init_step_index(timestep)
 
+        # use_corrector = (
+        #     self.step_index > 0 and self.step_index - 1 not in self.disable_corrector and self.last_sample is not None
+        # )
+        print("A")
         use_corrector = (
-            self.step_index > 0 and self.step_index - 1 not in self.disable_corrector and self.last_sample is not None
+            (self.step_index > 0)
+            & (~torch.isin(self.step_index - 1, torch.tensor(self.disable_corrector)))
+            & (self.last_sample is not None)
         )
 
+        print("B")
         model_output_convert = self.convert_model_output(model_output, sample=sample)
-        if use_corrector:
-            sample = self.multistep_uni_c_bh_update(
+        sample = torchax.interop.torch_view(jax.lax.cond)(
+            use_corrector,
+            lambda: self.multistep_uni_c_bh_update(
                 this_model_output=model_output_convert,
                 last_sample=self.last_sample,
                 this_sample=sample,
                 order=self.this_order,
-            )
+            ),
+            lambda: sample,
+        )
+        # if use_corrector:
+        #     sample = self.multistep_uni_c_bh_update(
+        #         this_model_output=model_output_convert,
+        #         last_sample=self.last_sample,
+        #         this_sample=sample,
+        #         order=self.this_order,
+        #     )
 
+        print("c")
+        """
         for i in range(self.config.solver_order - 1):
             self.model_outputs[i] = self.model_outputs[i + 1]
             self.timestep_list[i] = self.timestep_list[i + 1]
 
+        print("D")
         self.model_outputs[-1] = model_output_convert
         self.timestep_list[-1] = timestep
+        """
+        shifted_model_outputs = self.model_outputs[1:]
+        shifted_timesteps = self.timestep_list[1:]
+
+        # Concatenate the shifted part with the new model_output_convert and timestep
+        # Use unsqueeze(0) to add a new dimension for concatenation along axis 0
+        self.model_outputs = torch.cat(
+            [shifted_model_outputs, model_output_convert.unsqueeze(0)], dim=0
+        )
+        self.timestep_list = torch.cat(
+            [shifted_timesteps, timestep.unsqueeze(0)], dim=0
+        )
+
 
         if self.config.lower_order_final:
-            this_order = min(self.config.solver_order, len(self.timesteps) - self.step_index)
+            #this_order = min(self.config.solver_order, len(self.timesteps) - self.step_index)
+            this_order = torch.minimum(torch.tensor(self.config.solver_order), len(self.timesteps) - self.step_index)
         else:
             this_order = self.config.solver_order
 
-        self.this_order = min(this_order, self.lower_order_nums + 1)  # warmup for multistep
-        assert self.this_order > 0
-
+        print("E")
+        #self.this_order = min(this_order, self.lower_order_nums + 1)  # warmup for multistep
+        #self.this_order = torch.minimum(torch.tensor(this_order), torch.tensor(self.lower_order_nums + 1))
+        self.this_order = torchax.interop.torch_view(jnp.minimum)(this_order, self.lower_order_nums + 1)
+        #assert self.this_order > 0
+        
+        print("F")
         self.last_sample = sample
         prev_sample = self.multistep_uni_p_bh_update(
             model_output=model_output,  # pass the original non-converted model output, in case solver-p is used
             sample=sample,
             order=self.this_order,
         )
+        self._last_sample_is_valid_xla = True
+
+        print("G")
 
         if self.lower_order_nums < self.config.solver_order:
             self.lower_order_nums += 1
@@ -1020,10 +1135,10 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
         # upon completion increase step index by one
         self._step_index += 1
 
-        if not return_dict:
-            return (prev_sample,)
+        #if not return_dict:
+        return (prev_sample,)
 
-        return SchedulerOutput(prev_sample=prev_sample)
+        #return SchedulerOutput(prev_sample=prev_sample)
 
     def scale_model_input(self, sample: torch.Tensor, *args, **kwargs) -> torch.Tensor:
         """
@@ -1077,3 +1192,4 @@ class UniPCMultistepScheduler(SchedulerMixin, ConfigMixin):
 
     def __len__(self):
         return self.config.num_train_timesteps
+

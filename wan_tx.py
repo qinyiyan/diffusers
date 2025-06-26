@@ -14,7 +14,8 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from diffusers.utils import export_to_video
 from diffusers import AutoencoderKLWan, WanPipeline
-from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
+# from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
+from diffusers.schedulers.scheduling_unipc_multistep_flax import FlaxUniPCMultistepScheduler, UniPCMultistepSchedulerState
 
 from jax.tree_util import register_pytree_node
 
@@ -315,7 +316,12 @@ def main():
   vae = AutoencoderKLWan.from_pretrained(model_id, subfolder="vae", torch_dtype=torch.bfloat16)
   # flow_shift = 5.0 # 5.0 for 720P, 3.0 for 480P
   flow_shift = FLOW_SHIFT
-  scheduler = UniPCMultistepScheduler(prediction_type='flow_prediction', use_flow_sigmas=True, num_train_timesteps=1000, flow_shift=flow_shift)
+
+  scheduler = FlaxUniPCMultistepScheduler(prediction_type='flow_prediction', use_flow_sigmas=True, num_train_timesteps=1000, flow_shift=flow_shift)
+  scheduler_state = scheduler.create_state()
+  pipe.scheduler = scheduler
+  pipe.scheduler_state = scheduler_state
+
   pipe = WanPipeline.from_pretrained(model_id, vae=vae, torch_dtype=torch.bfloat16)
   pipe.scheduler = scheduler
 
@@ -338,26 +344,12 @@ def main():
   mesh = jax.make_mesh((len(jax.devices()),), (axis,))
   env.default_device_or_sharding = NamedSharding(mesh, P())
 
-  env._mesh = mesh
-  env.config.use_tpu_flash_attention = True
-  env.config.shmap_flash_attention = True
 
-  # Override flash attention with custom function
-  custom_attention = functools.partial(scaled_dot_product_attention, env=env)
-  # Workaround for the function lack is_view_op argument
-  # env.override_op_definition(torch.nn.functional.scaled_dot_product_attention, custom_attention)
-  op_to_override = torch.nn.functional.scaled_dot_product_attention
-  op_impl = custom_attention
-  env._ops[op_to_override] = ops_registry.Operator(
-        op_to_override,
-        op_impl,
-        is_jax_function=False,
-        is_user_defined=True,
-        needs_env=False,
-        is_view_op=False,
-    )
-
-
+  scheduler = FlaxUniPCMultistepScheduler(prediction_type='flow_prediction', use_flow_sigmas=True, num_train_timesteps=1000, flow_shift=flow_shift)
+  scheduler_state = scheduler.create_state()
+  pipe.scheduler = scheduler
+  pipe.scheduler_state = scheduler_state
+  
   vae_options = torchax.CompileOptions(
     methods_to_compile=['decode']
   )

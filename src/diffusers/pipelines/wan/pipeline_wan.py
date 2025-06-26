@@ -507,8 +507,9 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             negative_prompt_embeds = negative_prompt_embeds.to(transformer_dtype)
 
         # 4. Prepare timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
+
+        self.scheduler_state = self.scheduler.set_timesteps(self.scheduler_state, num_inference_steps, jax_view(latents.shape))
+        timesteps = torch_view(self.scheduler_state.timesteps)
 
         # 5. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels
@@ -525,55 +526,113 @@ class WanPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         )
 
         # 6. Denoising loop
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        # num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
 
-        with self.progress_bar(total=num_inference_steps) as progress_bar:
-            for i, t in enumerate(timesteps):
-                if self.interrupt:
-                    continue
 
-                self._current_timestep = t
-                latent_model_input = latents.to(transformer_dtype)
-                timestep = t.expand(latents.shape[0])
+        def loop_body_wan(
+            i,
+            loop_state, # (latents, prompt_embeds, negative_prompt_embeds, scheduler_state)
+            transformer,
+            scheduler,
+            timesteps,
+            transformer_dtype,
+            attention_kwargs,
+            do_classifier_free_guidance,
+            guidance_scale,
+            callback_on_step_end,
+            callback_on_step_end_tensor_inputs,
+            # Any other static pipeline attributes needed by the callback go here as arguments
+        ):
+            """
+            Pure function for one step of the diffusion loop, suitable for jax.lax.fori_loop.
 
-                noise_pred = self.transformer(
+            Returns:
+                tuple: Updated mutable state (new_latents, new_prompt_embeds, new_negative_prompt_embeds).
+            """
+
+            latents, prompt_embeds, negative_prompt_embeds, scheduler_state  = loop_state
+
+            # Retrieve current timestep using JAX array indexing
+            t = timesteps[i] # t will be a JAX array
+        
+            timestep = t.expand(latents.shape[0])
+
+            latent_model_input = latents.to(transformer_dtype)
+
+
+            noise_pred = transformer(
+                hidden_states=latent_model_input,
+                timestep=timestep,
+                encoder_hidden_states=prompt_embeds,
+                attention_kwargs=attention_kwargs,
+                return_dict=False,
+            )[0]
+
+            # 2. Perform Classifier-Free Guidance (CFG)
+            if do_classifier_free_guidance:
+                noise_uncond = transformer(
                     hidden_states=latent_model_input,
                     timestep=timestep,
-                    encoder_hidden_states=prompt_embeds,
+                    encoder_hidden_states=negative_prompt_embeds,
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                 )[0]
+                noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+            
+            # 3. Compute the previous noisy sample x_t -> x_t-1
 
-                if self.do_classifier_free_guidance:
-                    noise_uncond = self.transformer(
-                        hidden_states=latent_model_input,
-                        timestep=timestep,
-                        encoder_hidden_states=negative_prompt_embeds,
-                        attention_kwargs=attention_kwargs,
-                        return_dict=False,
-                    )[0]
-                    noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+            latents, scheduler_state = scheduler.step(jax_view(scheduler_state), jax_view(noise_pred), jax_view(t), jax_view(latents)).to_tuple()
+            new_latents = torch_view(latents)
+            # 4. Handle callback if provided
+            if callback_on_step_end is not None:
+                print("unimplemented callback_on_step_end")
+            else:
+                new_prompt_embeds = prompt_embeds
+                new_negative_prompt_embeds = negative_prompt_embeds
 
-                # compute the previous noisy sample x_t -> x_t-1
-                latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+            return new_latents, new_prompt_embeds, new_negative_prompt_embeds, scheduler_state
 
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+        initial_latents = latents.to('jax')
+        initial_prompt_embeds = prompt_embeds.to('jax')
+        initial_negative_prompt_embeds = negative_prompt_embeds.to('jax')
+        
 
-                # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
+        initial_scheduler_state = torch_view(self.scheduler_state)
+        initial_loop_state = (initial_latents, initial_prompt_embeds, initial_negative_prompt_embeds, initial_scheduler_state)
 
-                if XLA_AVAILABLE:
-                    xm.mark_step()
+        
+
+        transformer_model = self.transformer
+        scheduler_obj = self.scheduler
+        transformer_dtype_val = transformer_dtype
+        attention_kwargs_val = attention_kwargs
+        do_classifier_free_guidance_val = self.do_classifier_free_guidance
+        guidance_scale_val = guidance_scale
+        callback_on_step_end_fn = callback_on_step_end 
+        callback_on_step_end_tensor_inputs_list = callback_on_step_end_tensor_inputs 
+
+        print(f"timesteps: {timesteps}, num_inference_steps: {num_inference_steps}, transformer_dtype_val: {transformer_dtype_val}, attention_kwargs_val: {attention_kwargs_val}, do_classifier_free_guidance_val: {do_classifier_free_guidance_val}, guidance_scale_val: {guidance_scale_val}")
+
+        latents, prompt_embeds, negative_prompt_embeds, scheduler_state = torchax.interop.fori_loop(
+            0, 
+            len(timesteps),
+            lambda i, state: loop_body_wan(
+                i,
+                state,
+                transformer_model,
+                scheduler_obj,
+                timesteps,
+                transformer_dtype_val,
+                attention_kwargs_val,
+                do_classifier_free_guidance_val,
+                guidance_scale_val,
+                callback_on_step_end_fn,
+                callback_on_step_end_tensor_inputs_list,
+            ),
+            initial_loop_state
+        )
 
         self._current_timestep = None
 
